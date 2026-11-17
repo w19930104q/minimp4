@@ -40,6 +40,11 @@ extern "C" {
 // This switch affect return type of MP4D_frame_offset() function
 #define MINIMP4_ALLOW_64BIT       1
 
+// Demuxer support for 64-bit box sizes ('largesize') and 64-bit chunk
+// offsets (co64). Follows MINIMP4_ALLOW_64BIT: there is no point parsing
+// 64-bit values into a 32-bit boxsize_t.
+#define MP4D_64BIT_SUPPORTED      MINIMP4_ALLOW_64BIT
+
 #define MP4D_TRACE_SUPPORTED      0 // Debug trace
 #define MP4D_TRACE_TIMESTAMPS     1
 // Support parsing of supplementary information, not necessary for decoding:
@@ -179,7 +184,7 @@ typedef struct
     unsigned sample_count;
 
     // Elementary Stream Descriptor (ESDS) data offset
-    unsigned esds_offset;
+    MP4D_file_offset_t esds_offset;
 
     // ESDS data size
     unsigned esds_bytes;
@@ -357,7 +362,11 @@ typedef struct
     unsigned syncsamples_count;
 
 #if MP4D_TIMESTAMPS_SUPPORTED
-    unsigned *timestamp;
+    // Decoding timestamps (in track timescale units). 64-bit: a track whose
+    // timeline crosses the 2^32 timescale-unit boundary (e.g. 64-bit
+    // mdhd/tkhd durations) must not see its per-sample timestamps wrap.
+    uint64_t *timestamp;
+    // Per-sample durations (stts deltas); 32-bit, as in the file format.
     unsigned *duration;
     // Allocated length of timestamp/duration, tracked separately from any
     // publicly exposed sample count: a malformed file's stsz sample_count
@@ -368,7 +377,7 @@ typedef struct
 
     // Composition timestamps (dts + ctts offset), plus their allocated
     // length; NULL when the track has no ctts box.
-    unsigned *comp_timestamp;
+    uint64_t *comp_timestamp;
     unsigned comp_timestamp_count;
 #endif
 
@@ -463,14 +472,14 @@ int MP4D_open(MP4D_demux_t *mp4, int (*read_callback)(int64_t offset, void *buff
 *   MP4 term for 'frame'
 *
 *   frame_bytes [OUT]   - return coded frame size in bytes
-*   dts [OUT]           - return frame decoding timestamp (in mp4->timescale units)
-*   pts [OUT]           - return frame presentation timestamp (in mp4->timescale units)
+*   dts [OUT]           - return frame decoding timestamp (in mp4->timescale units), 64-bit
+*   pts [OUT]           - return frame presentation timestamp (in mp4->timescale units), 64-bit
 *   duration [OUT]      - return frame duration (in mp4->timescale units)
 *   is_sync [OUT]       - return non-zero if the frame is a sync frame
 *
 *   function return offset for the frame
 */
-MP4D_file_offset_t MP4D_frame_offset(const MP4D_demux_t *mp4, unsigned int ntrack, unsigned int nsample, unsigned int *frame_bytes, unsigned *dts, unsigned *pts, unsigned *duration, int *is_sync);
+MP4D_file_offset_t MP4D_frame_offset(const MP4D_demux_t *mp4, unsigned int ntrack, unsigned int nsample, unsigned int *frame_bytes, uint64_t *dts, uint64_t *pts, unsigned *duration, int *is_sync);
 
 /**
 *   Find the nearest sync frame at or before the given sample.
@@ -873,12 +882,12 @@ static void minimp4_vector_reset(minimp4_vector_t *h)
 /**
     Reallocate vector memory to the given size
 */
-static int minimp4_vector_grow(minimp4_vector_t *h, int bytes)
+static int minimp4_vector_grow(minimp4_vector_t *h, size_t bytes)
 {
     void *p;
     size_t new_size = h->capacity*2 + 1024;
-    if (new_size < h->capacity + (size_t)bytes)
-        new_size = h->capacity + (size_t)bytes + 1024;
+    if (new_size < h->capacity + bytes)
+        new_size = h->capacity + bytes + 1024;
     p = realloc(h->data, new_size);
     if (!p)
         return 0;
@@ -892,24 +901,24 @@ static int minimp4_vector_grow(minimp4_vector_t *h, int bytes)
     vector memory if necessary.
     Return allocated memory.
 */
-static unsigned char *minimp4_vector_alloc_tail(minimp4_vector_t *h, int bytes)
+static unsigned char *minimp4_vector_alloc_tail(minimp4_vector_t *h, size_t bytes)
 {
     unsigned char *p;
-    if (!h->data && !minimp4_vector_init(h, (size_t)2*bytes + 1024))
+    if (!h->data && !minimp4_vector_init(h, 2*bytes + 1024))
         return NULL;
-    if ((h->capacity - h->bytes) < (size_t)bytes && !minimp4_vector_grow(h, bytes))
+    if ((h->capacity - h->bytes) < bytes && !minimp4_vector_grow(h, bytes))
         return NULL;
     assert(h->data);
-    assert((h->capacity - h->bytes) >= (size_t)bytes);
+    assert((h->capacity - h->bytes) >= bytes);
     p = h->data + h->bytes;
-    h->bytes += (size_t)bytes;
+    h->bytes += bytes;
     return p;
 }
 
 /**
     Append data to the end of the vector (accumulate ot enqueue)
 */
-static unsigned char *minimp4_vector_put(minimp4_vector_t *h, const void *buf, int bytes)
+static unsigned char *minimp4_vector_put(minimp4_vector_t *h, const void *buf, size_t bytes)
 {
     unsigned char *tail = minimp4_vector_alloc_tail(h, bytes);
     if (tail)
@@ -1035,9 +1044,12 @@ int MP4E_set_pps(MP4E_mux_t *mux, int track_id, const void *pps, int bytes)
     return append_mem(&tr->vpps, pps, bytes) ? MP4E_STATUS_OK : MP4E_STATUS_NO_MEMORY;
 }
 
-static unsigned get_duration(const track_t *tr)
+static uint64_t get_duration(const track_t *tr)
 {
-    unsigned i, sum_duration = 0;
+    // 64-bit accumulator: the summed media timeline can cross the 2^32
+    // timescale-unit boundary even though each per-sample delta is 32-bit.
+    unsigned i;
+    uint64_t sum_duration = 0;
     const sample_t *s = (const sample_t *)tr->smpl.data;
     for (i = 0; i < tr->smpl.bytes/sizeof(sample_t); i++)
     {
@@ -1053,14 +1065,25 @@ static int write_pending_data(MP4E_mux_t *mux, track_t *tr)
     {
         // Complete pending sample
         sample_t *smpl_desc;
-        unsigned char base[8], *p = base;
+        unsigned char base[16], *p = base;
 
         assert(mux->sequential_mode_flag);
 
         // Write each sample to a separate atom
         assert(mux->sequential_mode_flag);      // Separate atom needed for sequential_mode only
-        WRITE_4(tr->pending_sample.bytes + 8);
-        WRITE_4(BOX_mdat);
+        if (tr->pending_sample.bytes + 8 > (size_t)0xffffffff)
+        {
+            // 64-bit 'largesize' mdat header: box size covers the 16-byte header
+            size_t box_bytes = tr->pending_sample.bytes + 16;
+            WRITE_4(1);
+            WRITE_4(BOX_mdat);
+            WRITE_4((uint64_t)box_bytes >> 32);
+            WRITE_4((uint64_t)box_bytes & 0xffffffff);
+        } else
+        {
+            WRITE_4(tr->pending_sample.bytes + 8);
+            WRITE_4(BOX_mdat);
+        }
         ERR(mux->write_callback(mux->write_pos, base, p - base, mux->token));
         mux->write_pos += p - base;
 
@@ -1309,6 +1332,20 @@ int MP4E_set_text_comment(MP4E_mux_t *mux, const char *comment)
 /**
 *   Write file index 'moov' box with all its boxes and indexes
 */
+#define MOOV_TIMESCALE 1000
+
+/**
+*   Convert a 64-bit media duration from track timescale to movie timescale
+*   without intermediate overflow (the naive duration*MOOV_TIMESCALE product
+*   can overflow 64 bits for very long timelines).
+*/
+static uint64_t duration_to_movie_timescale(uint64_t duration, unsigned time_scale)
+{
+    if (!time_scale)
+        return 0;
+    return duration / time_scale * MOOV_TIMESCALE + (duration % time_scale) * MOOV_TIMESCALE / time_scale;
+}
+
 static int mp4e_flush_index(MP4E_mux_t *mux)
 {
     unsigned char *stack_base[20]; // atoms nesting stack
@@ -1374,19 +1411,42 @@ static int mp4e_flush_index(MP4E_mux_t *mux)
     }
 
     // Write index atoms; order taken from Table 1 of [1]
-#define MOOV_TIMESCALE 1000
     ATOM(BOX_moov);
-        ATOM_FULL(BOX_mvhd, 0);
-        WRITE_4(0); // creation_time
-        WRITE_4(0); // modification_time
-
-        if (ntracks)
         {
-            track_t *tr = ((track_t*)mux->tracks.data) + 0;    // take 1st track
-            unsigned duration = get_duration(tr);
-            duration = tr->info.time_scale ? (unsigned)(duration * 1LL * MOOV_TIMESCALE / tr->info.time_scale) : 0;
-            WRITE_4(MOOV_TIMESCALE); // duration
-            WRITE_4(duration); // duration
+            // Movie duration in movie timescale, 64-bit. When it (or a track
+            // duration) crosses the 32-bit boundary, the affected boxes are
+            // written as version 1 with 64-bit time fields.
+            uint64_t movie_duration = 0;
+            int mvhd_version_1 = 0;
+            if (ntracks)
+            {
+                track_t *tr = ((track_t*)mux->tracks.data) + 0;    // take 1st track
+                movie_duration = duration_to_movie_timescale(get_duration(tr), tr->info.time_scale);
+                mvhd_version_1 = movie_duration > 0xffffffffULL;
+            }
+            ATOM_FULL(BOX_mvhd, mvhd_version_1 ? 0x01000000 : 0);
+            if (mvhd_version_1)
+            {
+                WRITE_4(0); WRITE_4(0); // creation_time, 64-bit
+                WRITE_4(0); WRITE_4(0); // modification_time, 64-bit
+            } else
+            {
+                WRITE_4(0); // creation_time
+                WRITE_4(0); // modification_time
+            }
+
+            if (ntracks)
+            {
+                WRITE_4(MOOV_TIMESCALE); // timescale
+                if (mvhd_version_1)
+                {
+                    WRITE_4((unsigned)(movie_duration >> 32)); // duration, 64-bit
+                    WRITE_4((unsigned)(movie_duration & 0xffffffff));
+                } else
+                {
+                    WRITE_4((unsigned)movie_duration); // duration
+                }
+            }
         }
 
         WRITE_4(0x00010000); // rate
@@ -1413,7 +1473,10 @@ static int mp4e_flush_index(MP4E_mux_t *mux)
     for (ntr = 0; ntr < ntracks; ntr++)
     {
         track_t *tr = ((track_t*)mux->tracks.data) + ntr;
-        unsigned duration = get_duration(tr);
+        uint64_t duration = get_duration(tr);   // media duration, track timescale
+        uint64_t tkhd_duration = duration_to_movie_timescale(duration, tr->info.time_scale);
+        int tkhd_version_1 = tkhd_duration > 0xffffffffULL;
+        int mdhd_version_1 = duration > 0xffffffffULL;
         int samples_count = (int)(tr->smpl.bytes / sizeof(sample_t));
         const sample_t *sample = (const sample_t *)tr->smpl.data;
         unsigned handler_type;
@@ -1443,12 +1506,26 @@ static int mp4e_flush_index(MP4E_mux_t *mux)
         }
 
         ATOM(BOX_trak);
-            ATOM_FULL(BOX_tkhd, 7); // flag: 1=trak enabled; 2=track in movie; 4=track in preview
-            WRITE_4(0);             // creation_time
-            WRITE_4(0);             // modification_time
+            ATOM_FULL(BOX_tkhd, tkhd_version_1 ? 0x01000007 : 7); // flag: 1=trak enabled; 2=track in movie; 4=track in preview
+            if (tkhd_version_1)
+            {
+                WRITE_4(0); WRITE_4(0); // creation_time, 64-bit
+                WRITE_4(0); WRITE_4(0); // modification_time, 64-bit
+            } else
+            {
+                WRITE_4(0);             // creation_time
+                WRITE_4(0);             // modification_time
+            }
             WRITE_4(ntr + 1);       // track_ID
             WRITE_4(0);             // reserved
-            WRITE_4(tr->info.time_scale ? (unsigned)(duration * 1LL * MOOV_TIMESCALE / tr->info.time_scale) : 0);
+            if (tkhd_version_1)
+            {
+                WRITE_4((unsigned)(tkhd_duration >> 32));
+                WRITE_4((unsigned)(tkhd_duration & 0xffffffff));
+            } else
+            {
+                WRITE_4((unsigned)tkhd_duration);
+            }
             WRITE_4(0); WRITE_4(0); // reserved[2]
             WRITE_2(0);             // layer
             WRITE_2(0);             // alternate_group
@@ -1472,11 +1549,25 @@ static int mp4e_flush_index(MP4E_mux_t *mux)
             END_ATOM;
 
             ATOM(BOX_mdia);
-                ATOM_FULL(BOX_mdhd, 0);
-                WRITE_4(0); // creation_time
-                WRITE_4(0); // modification_time
+                ATOM_FULL(BOX_mdhd, mdhd_version_1 ? 0x01000000 : 0);
+                if (mdhd_version_1)
+                {
+                    WRITE_4(0); WRITE_4(0); // creation_time, 64-bit
+                    WRITE_4(0); WRITE_4(0); // modification_time, 64-bit
+                } else
+                {
+                    WRITE_4(0); // creation_time
+                    WRITE_4(0); // modification_time
+                }
                 WRITE_4(tr->info.time_scale);
-                WRITE_4(duration); // duration
+                if (mdhd_version_1)
+                {
+                    WRITE_4((unsigned)(duration >> 32)); // duration, 64-bit
+                    WRITE_4((unsigned)(duration & 0xffffffff));
+                } else
+                {
+                    WRITE_4((unsigned)duration); // duration
+                }
                 {
                     int lang_code = ((tr->info.language[0] & 31) << 10) | ((tr->info.language[1] & 31) << 5) | (tr->info.language[2] & 31);
                     WRITE_2(lang_code); // language
@@ -1869,11 +1960,19 @@ static int mp4e_flush_index(MP4E_mux_t *mux)
     if (mux->enable_fragmentation)
     {
         track_t *tr = ((track_t*)mux->tracks.data) + 0;
-        uint32_t movie_duration = get_duration(tr);
+        uint64_t movie_duration = get_duration(tr);
 
         ATOM(BOX_mvex);
-            ATOM_FULL(BOX_mehd, 0);
-                WRITE_4(movie_duration); // duration
+            if (movie_duration > 0xffffffffULL)
+            {
+                ATOM_FULL(BOX_mehd, 0x01000000); // version 1: 64-bit duration
+                WRITE_4((unsigned)(movie_duration >> 32));
+                WRITE_4((unsigned)(movie_duration & 0xffffffff));
+            } else
+            {
+                ATOM_FULL(BOX_mehd, 0);
+                WRITE_4((unsigned)movie_duration); // duration
+            }
             END_ATOM;
         for (ntr = 0; ntr < ntracks; ntr++)
         {
@@ -3148,7 +3247,10 @@ broken_android_meta_hack:
 #if MP4D_TRACE_TIMESTAMPS || MP4D_TIMESTAMPS_SUPPORTED
         case BOX_stts:
             {
-                unsigned count, j, k = 0, ts = 0, ts_capacity;
+                unsigned count, j, k = 0, ts_capacity;
+                // 64-bit running timestamp: the summed stts deltas can cross
+                // the 2^32 timescale-unit boundary (64-bit mdhd durations).
+                uint64_t ts = 0;
                 // Hardening fix: g_fullbox[] registers BOX_stts with
                 // use_track_flag=0 (no active-track requirement enforced
                 // before this case runs), but the MP4D_TIMESTAMPS_SUPPORTED
@@ -3167,7 +3269,7 @@ broken_android_meta_hack:
                 // (uint64_t) cast: same native-arithmetic-overflow gap as
                 // BOX_stsz's entry_size MALLOC above, on this box's own
                 // unbounded, file-declared count.
-                MALLOC(unsigned int*, tr->timestamp, (uint64_t)ts_capacity*4);
+                MALLOC(uint64_t*, tr->timestamp, (uint64_t)ts_capacity*sizeof(uint64_t));
                 MALLOC(unsigned int*, tr->duration, (uint64_t)ts_capacity*4);
                 tr->timestamp_count = 0;
 #endif
@@ -3215,15 +3317,15 @@ broken_android_meta_hack:
                         uint64_t new_capacity = (uint64_t)ts_capacity * 2;
                         if (new_capacity < new_k)
                             new_capacity = new_k;
-                        if (new_capacity * sizeof(unsigned) > MINIMP4_MAX_ALLOC_BYTES)
-                            new_capacity = MINIMP4_MAX_ALLOC_BYTES / sizeof(unsigned);
+                        if (new_capacity * sizeof(uint64_t) > MINIMP4_MAX_ALLOC_BYTES)
+                            new_capacity = MINIMP4_MAX_ALLOC_BYTES / sizeof(uint64_t);
                         if (new_capacity < new_k)
                         {
                             ERROR("out of memory");
                         }
                         ts_capacity = (unsigned)new_capacity;
-                        tr->timestamp = (unsigned int*)realloc(tr->timestamp, ts_capacity * sizeof(unsigned));
-                        tr->duration  = (unsigned int*)realloc(tr->duration,  ts_capacity * sizeof(unsigned));
+                        tr->timestamp = (uint64_t*)realloc(tr->timestamp, ts_capacity * sizeof(tr->timestamp[0]));
+                        tr->duration  = (unsigned int*)realloc(tr->duration,  ts_capacity * sizeof(tr->duration[0]));
                         if (!tr->timestamp || !tr->duration)
                         {
                             ERROR("out of memory");
@@ -3250,7 +3352,7 @@ broken_android_meta_hack:
                 if (tr && tr->timestamp && tr->timestamp_count)
                 {
                     unsigned j, k = 0;
-                    MALLOC(unsigned int*, tr->comp_timestamp, (uint64_t)tr->timestamp_count * sizeof(unsigned int));
+                    MALLOC(uint64_t*, tr->comp_timestamp, (uint64_t)tr->timestamp_count * sizeof(uint64_t));
                     tr->comp_timestamp_count = tr->timestamp_count;
                     for (i = 0; i < count && k < tr->timestamp_count; i++)
                     {
@@ -3262,7 +3364,8 @@ broken_android_meta_hack:
                             sc = tr->timestamp_count - k;
                         for (j = 0; j < sc; j++)
                         {
-                            tr->comp_timestamp[k] = tr->timestamp[k] + d;
+                            // (int64_t): ctts v1 offsets are signed
+                            tr->comp_timestamp[k] = (uint64_t)((int64_t)tr->timestamp[k] + d);
                             k++;
                         }
                     }
@@ -3450,7 +3553,7 @@ broken_android_meta_hack:
                 break;
             if (!tr->esds_offset && payload_bytes)
             {
-                tr->esds_offset = (unsigned)mp4->read_pos;
+                tr->esds_offset = (MP4D_file_offset_t)mp4->read_pos;
                 tr->esds_bytes = (unsigned)payload_bytes;
             }
             break;
@@ -3869,7 +3972,7 @@ static int nearest_sync_sample(MP4D_track_t *tr, unsigned nsample)
 }
 
 // Exported API function
-MP4D_file_offset_t MP4D_frame_offset(const MP4D_demux_t *mp4, unsigned ntrack, unsigned nsample, unsigned *frame_bytes, unsigned *dts, unsigned *pts, unsigned *duration, int *is_sync)
+MP4D_file_offset_t MP4D_frame_offset(const MP4D_demux_t *mp4, unsigned ntrack, unsigned nsample, unsigned *frame_bytes, uint64_t *dts, uint64_t *pts, unsigned *duration, int *is_sync)
 {
     MP4D_track_t *tr = mp4->track + ntrack;
     unsigned ns;

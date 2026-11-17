@@ -103,7 +103,7 @@ int demux(uint8_t *input_buf, ssize_t input_size, FILE *fout, int ntrack)
     //for (ntrack = 0; ntrack < mp4.track_count; ntrack++)
     {
         MP4D_track_t *tr = mp4.track + ntrack;
-        unsigned sum_duration = 0;
+        uint64_t sum_duration = 0;
         i = 0;
         if (tr->handler_type == MP4D_HANDLER_TYPE_VIDE && tr->sample_entry == BOX_av01)
         {   // AV1: samples are raw OBUs (no length prefixes). Write the av1C
@@ -113,7 +113,8 @@ int demux(uint8_t *input_buf, ssize_t input_size, FILE *fout, int ntrack)
                 fwrite(tr->dsi + 4, 1, tr->dsi_bytes - 4, fout);
             for (i = 0; i < mp4.track[ntrack].sample_count; i++)
             {
-                unsigned frame_bytes, timestamp, duration;
+                unsigned frame_bytes, duration;
+                uint64_t timestamp;
                 int is_sync;
                 MP4D_file_offset_t ofs = MP4D_frame_offset(&mp4, ntrack, i, &frame_bytes, &timestamp, NULL, &duration, &is_sync);
                 fwrite(input_buf + ofs, 1, frame_bytes, fout);
@@ -139,7 +140,8 @@ int demux(uint8_t *input_buf, ssize_t input_size, FILE *fout, int ntrack)
             }
             for (i = 0; i < mp4.track[ntrack].sample_count; i++)
             {
-                unsigned frame_bytes, timestamp, duration;
+                unsigned frame_bytes, duration;
+                uint64_t timestamp;
                 int is_sync;
                 MP4D_file_offset_t ofs = MP4D_frame_offset(&mp4, ntrack, i, &frame_bytes, &timestamp, NULL, &duration, &is_sync);
                 uint8_t *mem = input_buf + ofs;
@@ -173,10 +175,11 @@ int demux(uint8_t *input_buf, ssize_t input_size, FILE *fout, int ntrack)
 #endif
             for (i = 0; i < mp4.track[ntrack].sample_count; i++)
             {
-                unsigned frame_bytes, timestamp, duration;
+                unsigned frame_bytes, duration;
+                uint64_t timestamp;
                 int is_sync;
                 MP4D_file_offset_t ofs = MP4D_frame_offset(&mp4, ntrack, i, &frame_bytes, &timestamp, NULL, &duration, &is_sync);
-                printf("ofs=%d frame_bytes=%d timestamp=%d duration=%d\n", (unsigned)ofs, frame_bytes, timestamp, duration);
+                printf("ofs=%llu frame_bytes=%d timestamp=%llu duration=%d\n", (unsigned long long)ofs, frame_bytes, (unsigned long long)timestamp, duration);
 #if ENABLE_AUDIO
                 UCHAR *frame = (UCHAR *)(input_buf + ofs);
                 UINT frame_size = frame_bytes;
